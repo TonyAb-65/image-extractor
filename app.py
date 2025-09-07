@@ -1,13 +1,10 @@
-# Image Extractor — Streamlit preprocessor
-# Upload an Excel/CSV with a 'thumbnail' URL column.
-# Outputs a new Excel with:
-#   - embedded preview images (for humans)
-#   - 'thumbnail_dataurl' base64 column (for OpenAI Vision)
+# app.py — Image Extractor (Streamlit)
+# Upload Excel/CSV with a 'thumbnail' URL column.
+# Outputs a new Excel that embeds small image previews and adds 'thumbnail_dataurl' (base64) per row.
 
 import io, base64, requests
 import pandas as pd
 import streamlit as st
-from urllib.parse import urlsplit
 from PIL import Image
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
@@ -20,9 +17,9 @@ THUMB_PX = 96
 
 st.set_page_config(page_title="Image Extractor", page_icon="🖼️", layout="centered")
 st.title("🖼️ Image Extractor")
-st.caption("Turns a products file with 'thumbnail' URLs into an Excel with embedded previews and a 'thumbnail_dataurl' base64 column.")
+st.caption("Turns a products file with a 'thumbnail' URL column into an Excel with embedded previews and a 'thumbnail_dataurl' base64 column.")
 
-# ---------- UI ----------
+# ---------- Inputs ----------
 up = st.file_uploader("Upload products file (.xlsx/.xls/.csv)", type=["xlsx","xls","csv"])
 limit = st.number_input("Max rows to process (0 = all)", min_value=0, value=0, step=100)
 start_btn = st.button("Process")
@@ -77,7 +74,7 @@ def read_any_table(f):
     if fn.endswith(".csv"):           return pd.read_csv(f)
     raise ValueError("Use .xlsx/.xls/.csv")
 
-def build_excel_with_images(df: pd.DataFrame, max_rows: int = 0) -> bytes:
+def build_excel_with_images(df: pd.DataFrame, max_rows: int = 0) -> tuple[bytes, pd.DataFrame]:
     if "thumbnail" not in df.columns:
         raise ValueError("Missing required column: 'thumbnail'")
 
@@ -105,6 +102,8 @@ def build_excel_with_images(df: pd.DataFrame, max_rows: int = 0) -> bytes:
     rows = ws.max_row - 1
     prog = st.progress(0.0, text="Downloading images…")
 
+    logs = []
+    ok = fail = 0
     for row_idx in range(2, ws.max_row + 1):
         url = str(ws.cell(row=row_idx, column=col_thumb).value or "").strip()
         dcell = ws.cell(row=row_idx, column=col_dataurl)
@@ -116,15 +115,19 @@ def build_excel_with_images(df: pd.DataFrame, max_rows: int = 0) -> bytes:
                 xl_img = XLImage(io.BytesIO(thumb))
                 ws.add_image(xl_img, ws.cell(row=row_idx, column=col_img).coordinate)
                 ws.row_dimensions[row_idx].height = 80
-        except Exception:
-            # leave row as-is on failure
-            pass
+                ok += 1
+                logs.append({"row": row_idx-1, "status": "ok"})
+            else:
+                fail += 1
+                logs.append({"row": row_idx-1, "status": "no-bytes"})
+        except Exception as e:
+            fail += 1
+            logs.append({"row": row_idx-1, "status": f"error:{type(e).__name__}"})
         if rows > 0:
-            done = row_idx - 1
-            prog.progress(done / rows, text=f"Processed {done}/{rows}")
+            prog.progress((row_idx-1)/rows, text=f"Processed {row_idx-1}/{rows}")
 
     out = io.BytesIO(); wb.save(out); out.seek(0)
-    return out.getvalue()
+    return out.getvalue(), pd.DataFrame(logs)
 
 # ---------- Action ----------
 if start_btn:
@@ -134,14 +137,37 @@ if start_btn:
         try:
             df = read_any_table(up)
             st.write({"rows": len(df), "columns": list(df.columns)})
-            buf = build_excel_with_images(df, max_rows=int(limit))
+
+            # Preview first 6 URLs in the browser (not Excel)
+            try:
+                sample = df["thumbnail"].astype(str).head(6).tolist()
+                st.caption("Preview of first URLs (browser view):")
+                cols = st.columns(3)
+                for i, u in enumerate(sample):
+                    with cols[i % 3]:
+                        st.image(u, caption=f"Row {i+1}", use_container_width=True)
+            except Exception:
+                pass
+
+            buf, logs = build_excel_with_images(df, max_rows=int(limit))
             st.success("Done. Download and use in your main dashboard.")
+
             st.download_button(
                 "Download preprocessed Excel",
                 data=buf,
                 file_name="products_with_images.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-            st.info("Next step: upload this file to your Product Mapping Dashboard.")
+
+            # Embed summary
+            if not logs.empty:
+                embedded_ok = int((logs["status"] == "ok").sum())
+                embedded_fail = len(logs) - embedded_ok
+                st.write({"embedded_ok": embedded_ok, "embedded_fail": embedded_fail})
+                st.dataframe(logs.head(50), use_container_width=True)
+            else:
+                st.write({"embedded_ok": 0, "embedded_fail": 0})
+
+            st.info("Open the XLSX in Microsoft Excel desktop to see embedded images. Google Sheets/Numbers may hide them.")
         except Exception as e:
             st.error(f"Failed: {type(e).__name__}: {e}")
