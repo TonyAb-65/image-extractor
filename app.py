@@ -2,10 +2,11 @@
 # Upload Excel/CSV with a 'thumbnail' URL column.
 # Outputs a new Excel that embeds small image previews and adds 'thumbnail_dataurl' (base64) per row.
 
-import io, base64, requests
+import io, base64, requests, urllib3
 import pandas as pd
 import streamlit as st
 from PIL import Image
+from requests.exceptions import SSLError
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils.dataframe import dataframe_to_rows
@@ -14,6 +15,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 TIMEOUT = 25
 MAX_BYTES = 12_000_000
 THUMB_PX = 96
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 st.set_page_config(page_title="Image Extractor", page_icon="🖼️", layout="centered")
 st.title("🖼️ Image Extractor")
@@ -33,15 +35,29 @@ def http_session():
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         "Accept-Language": "en",
         "Cache-Control": "no-cache",
+        "Referer": "",
     })
     return s
 
 def fetch_image(url: str) -> bytes:
     if not isinstance(url, str) or not url.strip():
         return b""
-    r = http_session().get(url, timeout=TIMEOUT, stream=True, allow_redirects=True)
+    s = http_session()
+    headers = {"Referer": url}
+    try:
+        r = s.get(url, timeout=TIMEOUT, stream=True, allow_redirects=True, headers=headers)
+    except SSLError:
+        r = s.get(url, timeout=TIMEOUT, stream=True, allow_redirects=True, headers=headers, verify=False)
     r.raise_for_status()
     data = r.content if r.content else r.raw.read(MAX_BYTES + 1)
+    if not data and url.startswith("https://"):
+        alt = "http://" + url[len("https://"):]
+        try:
+            r2 = s.get(alt, timeout=TIMEOUT, stream=True, allow_redirects=True, headers=headers)
+            r2.raise_for_status()
+            data = r2.content if r2.content else r2.raw.read(MAX_BYTES + 1)
+        except Exception:
+            return b""
     return data if data and len(data) <= MAX_BYTES else b""
 
 # ---------- Imaging ----------
@@ -93,7 +109,6 @@ def build_excel_with_images(df: pd.DataFrame, max_rows: int = 0) -> tuple[bytes,
     col_thumb = headers.index("thumbnail") + 1
     col_dataurl = headers.index("thumbnail_dataurl") + 1
 
-    # Insert preview column after dataurl
     ws.insert_cols(col_dataurl + 1, amount=1)
     ws.cell(row=1, column=col_dataurl + 1, value="thumbnail_image_embedded")
     col_img = col_dataurl + 1
@@ -138,14 +153,13 @@ if start_btn:
             df = read_any_table(up)
             st.write({"rows": len(df), "columns": list(df.columns)})
 
-            # Preview first 6 URLs in the browser (not Excel)
             try:
                 sample = df["thumbnail"].astype(str).head(6).tolist()
                 st.caption("Preview of first URLs (browser view):")
                 cols = st.columns(3)
                 for i, u in enumerate(sample):
                     with cols[i % 3]:
-                        st.image(u, caption=f"Row {i+1}", use_container_width=True)
+                        st.image(u, caption=f"Row {i+1}", width="stretch")
             except Exception:
                 pass
 
@@ -159,12 +173,11 @@ if start_btn:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-            # Embed summary
             if not logs.empty:
                 embedded_ok = int((logs["status"] == "ok").sum())
                 embedded_fail = len(logs) - embedded_ok
                 st.write({"embedded_ok": embedded_ok, "embedded_fail": embedded_fail})
-                st.dataframe(logs.head(50), use_container_width=True)
+                st.dataframe(logs.head(50), width="stretch")
             else:
                 st.write({"embedded_ok": 0, "embedded_fail": 0})
 
